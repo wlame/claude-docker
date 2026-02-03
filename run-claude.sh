@@ -220,9 +220,9 @@ _run_claude_completion() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    
+
     opts="-w --workspace -c --claude-config -n --name -i --image --rm --no-interactive --no-privileged --safe --no-gpg --gpg --build --rebuild --recreate --verbose --remove-containers --force-remove-all-containers --export-dockerfile --push-to --generate-completions --username --extra-package -E --forward-variable --aws -h --help"
-    
+
     case "${prev}" in
         -w|--workspace)
             COMPREPLY=( $(compgen -d -- ${cur}) )
@@ -267,7 +267,7 @@ _run_claude_completion() {
         *)
             ;;
     esac
-    
+
     COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
     return 0
 }
@@ -954,7 +954,6 @@ generate_dockerfile_content() {
     "zsh"
     "gh"
     "vim"
-    "neovim"
     "htop"
     "jq"
     "tree"
@@ -982,126 +981,24 @@ generate_dockerfile_content() {
     fi
   done
 
-  cat <<'DOCKERFILE_EOF'
-# vim: set ft=dockerfile:
-
-# ============================================================================
-# Stage 1: Base tools and development environment
-# ============================================================================
-FROM ubuntu:25.04 AS base-tools
-
-# Install system dependencies including zsh and tools
-RUN apt-get update && apt-get install -y \
-DOCKERFILE_EOF
-
-  # Insert the dynamic package list
-  echo -e "$package_lines"
-
-  cat <<'DOCKERFILE_EOF'
-
-# Clean up apt cache
-RUN rm -rf /var/lib/apt/lists/*
-
-# Install Go
-RUN ARCH=$(dpkg --print-architecture) && \
-	if [ "$ARCH" = "amd64" ]; then GOARCH="amd64"; else GOARCH="arm64"; fi && \
-	wget -O go.tar.gz "https://go.dev/dl/go1.21.5.linux-${GOARCH}.tar.gz" \
-	&& tar -C /usr/local -xzf go.tar.gz \
-	&& rm go.tar.gz
-ENV PATH=/usr/local/go/bin:$PATH
-ENV CGO_ENABLED=0
-
-# Create user
-ARG USERNAME=claude-user
-RUN useradd -m -s /bin/zsh ${USERNAME} \
-	&& echo ${USERNAME} ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/${USERNAME} \
-	&& chmod 0440 /etc/sudoers.d/${USERNAME}
-
-# Build and install Unsplash MCP server
-WORKDIR /tmp
-RUN git config --global url."https://github.com/".insteadOf git@github.com: \
-	&& git clone https://github.com/douglarek/unsplash-mcp-server.git \
-	&& cd unsplash-mcp-server \
-	&& go build -o /usr/local/bin/unsplash-mcp-server ./cmd/server \
-	&& git config --global --unset url."https://github.com/".insteadOf
-
-# ============================================================================
-# Stage 2: User environment setup (zsh, fnm, node)
-# ============================================================================
-FROM base-tools AS user-env
-
-# Switch to user and setup zsh with oh-my-zsh
-USER $USERNAME
-WORKDIR /home/$USERNAME
-
-# Set up oh-my-zsh and plugins
-RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
-	&& git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
-	&& git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
-
-# Setup fnm for user
-RUN curl -o- https://fnm.vercel.app/install | bash
-ENV PATH="/home/$USERNAME/.local/share/fnm:$PATH"
-SHELL ["/bin/bash", "-c"]
-RUN eval "$(fnm env)" && fnm install 22 && fnm default 22 && fnm use 22
-
-
-# Install LazyVim
-RUN git clone https://github.com/LazyVim/starter ~/.config/nvim \
-	&& rm -rf ~/.config/nvim/.git
-
-RUN nvim --headless "+Lazy! sync" +qa
-
-# ============================================================================
-# Stage 3: Claude and MCP servers
-# ============================================================================
-FROM user-env AS claude-mcp
-
-# Install Claude CLI
-RUN eval "$(fnm env)" && curl -fsSL https://claude.ai/install.sh | bash
-ENV PATH=/home/$USERNAME/.local/bin:$PATH
-
-# Install Playwright MCP via npm
-RUN eval "$(fnm env)" && npm install -g @playwright/mcp@latest
-
-# Setup MCP servers using claude mcp add
-RUN eval "$(fnm env)" && claude mcp add unsplash \
-	--scope user \
-	/usr/local/bin/unsplash-mcp-server
-
-RUN eval "$(fnm env)" && claude mcp add context7 \
-	--scope user \
-  --transport http \
-	https://mcp.context7.com/mcp
-
-RUN eval "$(fnm env)" && claude mcp add playwright \
-	--scope user \
-	npx @playwright/mcp@latest
-
-# ============================================================================
-# Stage 4: Final runtime image
-# ============================================================================
-FROM claude-mcp AS final
-
-# Create entrypoint script that handles workspace directory change (as root)
-USER root
-RUN cat > /entrypoint.sh << 'EOF'
-#!/bin/sh
+  # Generate base64-encoded scripts to avoid heredoc issues with Docker parser
+  # entrypoint.sh content
+  local entrypoint_script='#!/bin/sh
 
 # Merge Claude config from host file if available
 if [ -f "$HOME/.claude.host.json" ]; then
   CONFIG_KEYS="oauthAccount hasSeenTasksHint userID hasCompletedOnboarding lastOnboardingVersion subscriptionNoticeCount hasAvailableSubscription s1mAccessCache"
-  
+
   # Build jq expression for extraction
   JQ_EXPR=""
   for key in $CONFIG_KEYS; do
     if [ -n "$JQ_EXPR" ]; then JQ_EXPR="$JQ_EXPR, "; fi
     JQ_EXPR="$JQ_EXPR\"$key\": .$key"
   done
-  
+
   # Extract config data and add bypass permissions
   HOST_CONFIG=$(jq -c "{$JQ_EXPR, \"bypassPermissionsModeAccepted\": true}" "$HOME/.claude.host.json" 2>/dev/null || echo "")
-  
+
   if [ -n "$HOST_CONFIG" ] && [ "$HOST_CONFIG" != "null" ] && [ "$HOST_CONFIG" != "{}" ]; then
     if [ -f "$HOME/.claude.json" ]; then
       # Merge with existing container file
@@ -1128,12 +1025,12 @@ fi
 if [ -S "/gpg-agent-extra" ]; then
   # Detect expected socket location dynamically
   EXPECTED_SOCKET=$(gpgconf --list-dirs agent-socket 2>/dev/null)
-  
+
   if [ -n "$EXPECTED_SOCKET" ]; then
     # Create directory structure for expected socket location
     mkdir -p "$(dirname "$EXPECTED_SOCKET")"
     chmod 700 "$(dirname "$EXPECTED_SOCKET")"
-    
+
     # Link forwarded socket to expected location
     ln -sf /gpg-agent-extra "$EXPECTED_SOCKET"
     if [ "$RUN_CLAUDE_VERBOSE" = "1" ]; then
@@ -1156,40 +1053,32 @@ if [ -n "$WORKSPACE_PATH" ] && [ -d "$WORKSPACE_PATH" ]; then
 fi
 
 exec "$@"
-EOF
-RUN chmod +x /entrypoint.sh
+'
 
-# Create claude-exec wrapper script for proper environment setup in docker exec
-RUN cat > /usr/local/bin/claude-exec << 'EOF'
-#!/bin/zsh
+  # claude-exec content
+  local claude_exec_script='#!/bin/zsh
 
 # Change to workspace directory if available, fallback to home
 if [[ -n "$WORKSPACE_PATH" && -d "$WORKSPACE_PATH" ]]; then
-	cd "$WORKSPACE_PATH"
+  cd "$WORKSPACE_PATH"
 else
-	cd ~
+  cd ~
 fi
 
 # Execute the requested command or start interactive zsh
 if [[ $# -gt 0 ]]; then
-	# Source zsh environment files for command execution
-	[[ -f ~/.zshenv ]] && source ~/.zshenv
-	[[ -f ~/.zshrc ]] && source ~/.zshrc
-	exec "$@"
+  # Source zsh environment files for command execution
+  [[ -f ~/.zshenv ]] && source ~/.zshenv
+  [[ -f ~/.zshrc ]] && source ~/.zshrc
+  exec "$@"
 else
-	# Let zsh handle its own sourcing for interactive shells
-	exec /bin/zsh
+  # Let zsh handle its own sourcing for interactive shells
+  exec /bin/zsh
 fi
-EOF
-RUN chmod +x /usr/local/bin/claude-exec
+'
 
-# Set working directory for user sessions
-USER $USERNAME
-WORKDIR /home/$USERNAME
-
-# Configure zsh with theme, plugins, and aliases
-RUN cat > ~/.zshrc << 'EOF'
-export ZSH="$HOME/.oh-my-zsh"
+  # zshrc content
+  local zshrc_script='export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME="robbyrussell"
 plugins=(git zsh-autosuggestions zsh-syntax-highlighting)
 source $ZSH/oh-my-zsh.sh
@@ -1207,7 +1096,7 @@ eval "$(fnm env --use-on-cd --shell zsh)"
 
 # Claude aliases - conditional based on dangerous mode
 if [ "$CLAUDE_DANGEROUS_MODE" = "1" ] || [ "$ANTHROPIC_DANGEROUS_MODE" = "1" ]; then
-	alias claude="claude --dangerously-skip-permissions"
+  alias claude="claude --dangerously-skip-permissions"
 fi
 alias claude-safe="command claude"
 
@@ -1218,8 +1107,146 @@ alias vi="nvim"
 
 # Git SSH configuration
 export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
-EOF
+'
 
+  # Base64 encode the scripts
+  local entrypoint_b64=$(echo -n "$entrypoint_script" | base64 | tr -d '\n')
+  local claude_exec_b64=$(echo -n "$claude_exec_script" | base64 | tr -d '\n')
+  local zshrc_b64=$(echo -n "$zshrc_script" | base64 | tr -d '\n')
+
+  cat <<'DOCKERFILE_EOF'
+# vim: set ft=dockerfile:
+
+# ============================================================================
+# Stage 1: Base tools and development environment
+# ============================================================================
+FROM ubuntu:25.04 AS base-tools
+
+# Install system dependencies including zsh and tools
+RUN apt-get update && apt-get install -y \
+DOCKERFILE_EOF
+
+  # Insert the dynamic package list
+  echo -e "$package_lines"
+
+  cat <<'DOCKERFILE_EOF'
+
+# Clean up apt cache
+RUN rm -rf /var/lib/apt/lists/*
+
+# Install Go
+RUN ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "amd64" ]; then GOARCH="amd64"; else GOARCH="arm64"; fi && \
+    wget -O go.tar.gz "https://go.dev/dl/go1.21.5.linux-${GOARCH}.tar.gz" && \
+    tar -C /usr/local -xzf go.tar.gz && \
+    rm go.tar.gz
+ENV PATH=/usr/local/go/bin:$PATH
+ENV CGO_ENABLED=0
+
+# Install Neovim from GitHub releases (Ubuntu package is too old for LazyVim)
+RUN ARCH=$(dpkg --print-architecture) && \
+    NVIM_VERSION="v0.11.2" && \
+    if [ "$ARCH" = "amd64" ]; then NVIM_ARCH="linux-x86_64"; else NVIM_ARCH="linux-arm64"; fi && \
+    wget -O nvim.tar.gz "https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-${NVIM_ARCH}.tar.gz" && \
+    tar -C /opt -xzf nvim.tar.gz && \
+    ln -s /opt/nvim-${NVIM_ARCH}/bin/nvim /usr/local/bin/nvim && \
+    rm nvim.tar.gz
+ENV PATH=/opt/nvim-linux-x86_64/bin:/opt/nvim-linux-arm64/bin:$PATH
+
+# Create user
+ARG USERNAME=claude-user
+RUN useradd -m -s /bin/zsh ${USERNAME} && \
+    echo "${USERNAME} ALL=(root) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} && \
+    chmod 0440 /etc/sudoers.d/${USERNAME}
+
+# Build and install Unsplash MCP server
+WORKDIR /tmp
+RUN git config --global url."https://github.com/".insteadOf git@github.com: && \
+    git clone https://github.com/douglarek/unsplash-mcp-server.git && \
+    cd unsplash-mcp-server && \
+    go build -o /usr/local/bin/unsplash-mcp-server ./cmd/server && \
+    git config --global --unset url."https://github.com/".insteadOf
+
+# ============================================================================
+# Stage 2: User environment setup (zsh, fnm, node)
+# ============================================================================
+FROM base-tools AS user-env
+
+# Switch to user and setup zsh with oh-my-zsh
+USER $USERNAME
+WORKDIR /home/$USERNAME
+
+# Set up oh-my-zsh and plugins
+RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended && \
+    git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions && \
+    git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
+
+# Setup fnm for user
+RUN curl -o- https://fnm.vercel.app/install | bash
+ENV PATH="/home/$USERNAME/.local/share/fnm:$PATH"
+SHELL ["/bin/bash", "-c"]
+RUN eval "$(fnm env)" && fnm install 22 && fnm default 22 && fnm use 22
+
+# Install LazyVim
+RUN git clone https://github.com/LazyVim/starter ~/.config/nvim && \
+    rm -rf ~/.config/nvim/.git
+
+RUN nvim --headless "+Lazy! sync" +qa
+
+# ============================================================================
+# Stage 3: Claude and MCP servers
+# ============================================================================
+FROM user-env AS claude-mcp
+
+# Install Claude CLI
+RUN eval "$(fnm env)" && curl -fsSL https://claude.ai/install.sh | bash
+ENV PATH=/home/$USERNAME/.local/bin:$PATH
+
+# Install Playwright MCP via npm
+RUN eval "$(fnm env)" && npm install -g @playwright/mcp@latest
+
+# Setup MCP servers using claude mcp add
+RUN eval "$(fnm env)" && claude mcp add unsplash \
+    --scope user \
+    /usr/local/bin/unsplash-mcp-server
+
+RUN eval "$(fnm env)" && claude mcp add context7 \
+    --scope user \
+    --transport http \
+    https://mcp.context7.com/mcp
+
+RUN eval "$(fnm env)" && claude mcp add playwright \
+    --scope user \
+    npx @playwright/mcp@latest
+
+# ============================================================================
+# Stage 4: Final runtime image
+# ============================================================================
+FROM claude-mcp AS final
+
+# Create entrypoint script (using base64 to avoid heredoc parsing issues)
+USER root
+DOCKERFILE_EOF
+
+  # Output the base64 decode commands for each script
+  echo "RUN echo '$entrypoint_b64' | base64 -d > /entrypoint.sh && chmod +x /entrypoint.sh"
+  echo ""
+  echo "# Create claude-exec wrapper script for proper environment setup in docker exec"
+  echo "RUN echo '$claude_exec_b64' | base64 -d > /usr/local/bin/claude-exec && chmod +x /usr/local/bin/claude-exec"
+  echo ""
+
+  cat <<'DOCKERFILE_EOF'
+# Set working directory for user sessions
+USER $USERNAME
+WORKDIR /home/$USERNAME
+
+# Configure zsh with theme, plugins, and aliases
+DOCKERFILE_EOF
+
+  echo "RUN echo '$zshrc_b64' | base64 -d > ~/.zshrc"
+  echo ""
+
+  cat <<'DOCKERFILE_EOF'
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["/bin/zsh"]
 DOCKERFILE_EOF
