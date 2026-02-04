@@ -89,6 +89,20 @@ EXTRA_PACKAGES=()
 PASSTHROUGH_ARGS=()
 EXTRA_VOLUMES=()
 
+# Detect macOS by checking if home directory starts with /Users/
+# macOS has path incompatibilities with container (different home paths)
+# so we use selective mounting by default on macOS
+IS_MACOS=false
+if [[ "$HOME" == /Users/* ]]; then
+  IS_MACOS=true
+fi
+
+# Selective mount mode: only mount settings.json and rules (not full ~/.claude)
+# Default: true on macOS, false on Linux
+SELECTIVE_CLAUDE_MOUNT="$IS_MACOS"
+FORCE_SELECTIVE_MOUNT=false
+FORCE_FULL_MOUNT=false
+
 # List of environment variables to forward to the container
 FORWARDED_VARIABLES=(
   "ANTHROPIC_API_KEY"
@@ -221,7 +235,7 @@ _run_claude_completion() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    opts="-w --workspace -c --claude-config -n --name -i --image --rm --no-interactive --no-privileged --safe --no-gpg --gpg --build --rebuild --recreate --verbose --remove-containers --force-remove-all-containers --export-dockerfile --push-to --generate-completions --username --extra-package -E --forward-variable --aws -h --help"
+    opts="-w --workspace -c --claude-config -n --name -i --image --rm --no-interactive --no-privileged --safe --no-gpg --gpg --build --rebuild --recreate --verbose --remove-containers --force-remove-all-containers --export-dockerfile --push-to --generate-completions --username --extra-package -E --forward-variable --aws --mount-rules-only --mount-full-claude -h --help"
 
     case "${prev}" in
         -w|--workspace)
@@ -307,6 +321,8 @@ _run_claude_zsh_completion() {
         '-E[Forward environment variable]:variable:(AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY GITHUB_TOKEN)'
         '--forward-variable[Forward environment variable]:variable:(AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY GITHUB_TOKEN)'
         '--aws[Enable AWS integration: forward AWS vars and mount ~/.aws]'
+        '--mount-rules-only[Only mount settings.json and rules (default on macOS)]'
+        '--mount-full-claude[Mount full ~/.claude directory (default on Linux)]'
         '(-h --help)'{-h,--help}'[Show help]'
     )
     _arguments -s -S $options
@@ -357,6 +373,11 @@ usage() {
   echo "                          Use -E !VAR to exclude a variable from the default forwarded list"
   echo "  --aws                   Enable AWS integration: forward common AWS environment variables"
   echo "                          and mount ~/.aws directory to container (readonly)"
+  echo "  --mount-rules-only      Only mount ~/.claude/settings.json and ~/.claude/rules (read-only)"
+  echo "                          instead of the full ~/.claude directory. This is the default on macOS"
+  echo "                          to avoid path incompatibilities. Use this flag on Linux if needed."
+  echo "  --mount-full-claude     Mount the full ~/.claude directory (default on Linux)."
+  echo "                          Use this flag on macOS to override selective mounting."
   echo "  --                      Pass remaining arguments directly to docker run/exec"
   echo "  -h, --help              Show this help"
   echo ""
@@ -547,6 +568,14 @@ while [[ $# -gt 0 ]]; do
     fi
     shift
     ;;
+  --mount-rules-only)
+    FORCE_SELECTIVE_MOUNT=true
+    shift
+    ;;
+  --mount-full-claude)
+    FORCE_FULL_MOUNT=true
+    shift
+    ;;
   -h | --help)
     usage
     exit 0
@@ -582,6 +611,20 @@ done
 if [[ "$RUN_CLAUDE_NO_GPG" == "1" && "$ENABLE_GPG" == "true" ]]; then
   ENABLE_GPG=false
 fi
+
+# Resolve selective Claude mount mode
+# Priority: explicit flags > OS detection
+if [[ "$FORCE_FULL_MOUNT" == "true" && "$FORCE_SELECTIVE_MOUNT" == "true" ]]; then
+  echo -e "${RED}Error: Cannot use --mount-rules-only and --mount-full-claude together${NC}"
+  exit 1
+fi
+
+if [[ "$FORCE_SELECTIVE_MOUNT" == "true" ]]; then
+  SELECTIVE_CLAUDE_MOUNT=true
+elif [[ "$FORCE_FULL_MOUNT" == "true" ]]; then
+  SELECTIVE_CLAUDE_MOUNT=false
+fi
+# Otherwise SELECTIVE_CLAUDE_MOUNT keeps its default based on IS_MACOS
 
 # Handle extra packages from environment variable
 if [[ -n "$RUN_CLAUDE_EXTRA_PACKAGES" ]]; then
@@ -705,9 +748,39 @@ if [[ -f "$HOME/.claude.json" ]]; then
 fi
 
 # Add volume mounts
+# Workspace is always mounted
 DOCKER_CMD="$DOCKER_CMD \
-	-v $CLAUDE_CONFIG_PATH:/home/$USERNAME/.claude \
 	-v $WORKSPACE_PATH:/home/$USERNAME/$WORKSPACE_BASENAME"
+
+# Claude config mounting depends on SELECTIVE_CLAUDE_MOUNT mode
+if [[ "$SELECTIVE_CLAUDE_MOUNT" == "true" ]]; then
+  # Selective mount mode (default on macOS): only mount settings and rules
+  # This avoids path incompatibilities between host (/Users/...) and container (/home/...)
+  # for plugins, projects, and other path-dependent data
+  if [[ "$VERBOSE" == "true" ]]; then
+    echo -e "${MAGENTA}Using selective Claude mount mode (macOS compatible)${NC}"
+  fi
+
+  # Mount settings.json read-only if it exists
+  if [[ -f "$CLAUDE_CONFIG_PATH/settings.json" ]]; then
+    DOCKER_CMD="$DOCKER_CMD \
+	-v $CLAUDE_CONFIG_PATH/settings.json:/home/$USERNAME/.claude/settings.json:ro"
+  fi
+
+  # Mount rules directory read-only if it exists
+  if [[ -d "$CLAUDE_CONFIG_PATH/rules" ]]; then
+    DOCKER_CMD="$DOCKER_CMD \
+	-v $CLAUDE_CONFIG_PATH/rules:/home/$USERNAME/.claude/rules:ro"
+  fi
+else
+  # Full mount mode (default on Linux): mount entire ~/.claude directory
+  # Linux paths (/home/...) are compatible between host and container
+  if [[ "$VERBOSE" == "true" ]]; then
+    echo -e "${MAGENTA}Using full Claude mount mode (Linux compatible)${NC}"
+  fi
+  DOCKER_CMD="$DOCKER_CMD \
+	-v $CLAUDE_CONFIG_PATH:/home/$USERNAME/.claude"
+fi
 
 # Add optional read-only mounts if they exist
 if [[ -d "$HOME/.ssh" ]]; then
@@ -788,6 +861,10 @@ fi
 build_image() {
   echo -e "${MAGENTA}Building Docker image ${BRIGHT_CYAN}$IMAGE_NAME${MAGENTA}...${NC}"
 
+  # Get host UID/GID for proper file permissions on mounted volumes
+  HOST_UID=$(id -u)
+  HOST_GID=$(id -g)
+
   # Create temporary directory for Dockerfile
   TEMP_DIR=$(mktemp -d)
   trap "rm -rf $TEMP_DIR" EXIT
@@ -795,14 +872,20 @@ build_image() {
   # Generate Dockerfile using shared function
   generate_dockerfile_content >"$TEMP_DIR/Dockerfile"
 
-  # Build the image
+  # Build the image with host user's UID/GID
+  local BUILD_ARGS="--build-arg USERNAME=$USERNAME --build-arg HOST_UID=$HOST_UID --build-arg HOST_GID=$HOST_GID"
+
   if [[ "$DRY_RUN" == "true" ]]; then
-    echo -e "${MAGENTA}Would execute: ${BRIGHT_CYAN}docker build --build-arg USERNAME=\"$USERNAME\" -t \"$IMAGE_NAME\" \"$TEMP_DIR\"${NC}"
+    echo -e "${MAGENTA}Would execute: ${BRIGHT_CYAN}docker build $BUILD_ARGS -t \"$IMAGE_NAME\" \"$TEMP_DIR\"${NC}"
     echo -e "${GREEN}Dry run complete - would have built Docker image.${NC}"
     return 0
   fi
 
-  if docker build --build-arg USERNAME="$USERNAME" -t "$IMAGE_NAME" "$TEMP_DIR"; then
+  if [[ "$VERBOSE" == "true" ]]; then
+    echo -e "${MAGENTA}Building with UID=${BRIGHT_CYAN}$HOST_UID${MAGENTA} GID=${BRIGHT_CYAN}$HOST_GID${NC}"
+  fi
+
+  if docker build $BUILD_ARGS -t "$IMAGE_NAME" "$TEMP_DIR"; then
     echo -e "${MAGENTA}Successfully built ${BRIGHT_CYAN}$IMAGE_NAME${NC}"
   else
     echo -e "${RED}Failed to build Docker image${NC}"
@@ -1079,12 +1162,12 @@ fi
 
   # zshrc content
   local zshrc_script='export ZSH="$HOME/.oh-my-zsh"
-ZSH_THEME="robbyrussell"
+ZSH_THEME="example"
 plugins=(git zsh-autosuggestions zsh-syntax-highlighting)
 source $ZSH/oh-my-zsh.sh
 
 # Colorful prompt prefix
-export PS1="%F{red}[%F{yellow}r%F{green}u%F{cyan}n%F{blue}-%F{magenta}c%F{red}l%F{yellow}a%F{green}u%F{cyan}d%F{blue}e%F{magenta}]%f $PS1"
+export PS1="%F{yellow}[%F{red}cc%F{yellow}]%f $PS1"
 
 # History configuration
 HISTFILE=~/.zsh_history
@@ -1153,9 +1236,12 @@ RUN ARCH=$(dpkg --print-architecture) && \
     rm nvim.tar.gz
 ENV PATH=/opt/nvim-linux-x86_64/bin:/opt/nvim-linux-arm64/bin:$PATH
 
-# Create user
+# Create user with host UID/GID for proper file permissions on mounted volumes
 ARG USERNAME=claude-user
-RUN useradd -m -s /bin/zsh ${USERNAME} && \
+ARG HOST_UID=1000
+ARG HOST_GID=1000
+RUN groupadd -g ${HOST_GID} ${USERNAME} && \
+    useradd -m -s /bin/zsh -u ${HOST_UID} -g ${HOST_GID} ${USERNAME} && \
     echo "${USERNAME} ALL=(root) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} && \
     chmod 0440 /etc/sudoers.d/${USERNAME}
 
@@ -1267,7 +1353,8 @@ export_dockerfile() {
   generate_dockerfile_content >"$OUTPUT_FILE"
 
   echo -e "${MAGENTA}Dockerfile exported successfully!${NC}"
-  echo -e "${YELLOW}To build: docker build --build-arg USERNAME=claude-user -t your-image-name .${NC}"
+  echo -e "${YELLOW}To build with your user's UID/GID (recommended):${NC}"
+  echo -e "${BRIGHT_CYAN}  docker build --build-arg USERNAME=\$(whoami) --build-arg HOST_UID=\$(id -u) --build-arg HOST_GID=\$(id -g) -t your-image-name .${NC}"
 }
 
 # Function to push image to repository
