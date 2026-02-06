@@ -72,7 +72,7 @@ CONTAINER_NAME="claude-code-$WORKSPACE_SANITIZED-$WORKSPACE_HASH"
 CLAUDE_CONFIG_PATH="$HOME/.claude"
 INTERACTIVE=true
 REMOVE_CONTAINER=false
-PRIVILEGED=true
+PRIVILEGED=false
 DANGEROUS_MODE=true
 BUILD_ONLY=false
 FORCE_REBUILD=false
@@ -235,7 +235,7 @@ _run_claude_completion() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    opts="-w --workspace -c --claude-config -n --name -i --image --rm --no-interactive --no-privileged --safe --no-gpg --gpg --build --rebuild --recreate --verbose --remove-containers --force-remove-all-containers --export-dockerfile --push-to --generate-completions --username --extra-package -E --forward-variable --aws --mount-rules-only --mount-full-claude -h --help"
+    opts="-w --workspace -c --claude-config -n --name -i --image --rm --no-interactive --privileged --no-privileged --safe --no-gpg --gpg --build --rebuild --recreate --verbose --remove-containers --force-remove-all-containers --export-dockerfile --push-to --generate-completions --username --extra-package -E --forward-variable --aws --mount-rules-only --mount-full-claude -h --help"
 
     case "${prev}" in
         -w|--workspace)
@@ -303,7 +303,8 @@ _run_claude_zsh_completion() {
         '--image[Set image name]:image:'
         '--rm[Remove container after exit]'
         '--no-interactive[Run in non-interactive mode]'
-        '--no-privileged[Run without privileged mode]'
+        '--privileged[Run with full Docker privileged mode]'
+        '--no-privileged[Run without privileged mode (default)]'
         '--safe[Disable dangerous permissions]'
         '--no-gpg[Disable GPG agent forwarding]'
         '--gpg[Enable GPG agent forwarding]'
@@ -347,7 +348,8 @@ usage() {
   echo "  -i, --image NAME        Set image name (default: claude-code:latest)"
   echo "  --rm                    Remove container after exit (default: persistent)"
   echo "  --no-interactive        Run in non-interactive mode"
-  echo "  --no-privileged         Run without privileged mode"
+  echo "  --privileged            Run with full Docker privileged mode (default: off)"
+  echo "  --no-privileged         Run without privileged mode (default, uses targeted capabilities)"
   echo "  --safe                  Disable dangerous permissions"
   echo "  --no-gpg                Disable GPG agent forwarding"
   echo "  --gpg                   Enable GPG agent forwarding (overrides RUN_CLAUDE_NO_GPG)"
@@ -467,6 +469,10 @@ while [[ $# -gt 0 ]]; do
     ;;
   --no-interactive)
     INTERACTIVE=false
+    shift
+    ;;
+  --privileged)
+    PRIVILEGED=true
     shift
     ;;
   --no-privileged)
@@ -695,6 +701,12 @@ fi
 
 if [[ "$PRIVILEGED" == "true" ]]; then
   DOCKER_CMD="$DOCKER_CMD --privileged"
+else
+  # Add targeted capabilities for Playwright/Chromium sandbox
+  # SYS_ADMIN: required for Chromium's namespace sandbox
+  # seccomp=unconfined: allows syscalls Chromium needs that Docker's default profile blocks
+  # shm-size: Chromium uses /dev/shm for IPC; Docker's default 64MB causes crashes
+  DOCKER_CMD="$DOCKER_CMD --cap-add=SYS_ADMIN --security-opt seccomp=unconfined --shm-size=2g"
 fi
 
 DOCKER_CMD="$DOCKER_CMD --name $CONTAINER_NAME"
@@ -874,6 +886,10 @@ build_image() {
 
   # Build the image with host user's UID/GID
   local BUILD_ARGS="--build-arg USERNAME=$USERNAME --build-arg HOST_UID=$HOST_UID --build-arg HOST_GID=$HOST_GID"
+
+  if [[ "$FORCE_REBUILD" == "true" ]]; then
+    BUILD_ARGS="$BUILD_ARGS --no-cache"
+  fi
 
   if [[ "$DRY_RUN" == "true" ]]; then
     echo -e "${MAGENTA}Would execute: ${BRIGHT_CYAN}docker build $BUILD_ARGS -t \"$IMAGE_NAME\" \"$TEMP_DIR\"${NC}"
