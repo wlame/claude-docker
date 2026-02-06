@@ -1237,10 +1237,11 @@ RUN ARCH=$(dpkg --print-architecture) && \
 ENV PATH=/opt/nvim-linux-x86_64/bin:/opt/nvim-linux-arm64/bin:$PATH
 
 # Create user with host UID/GID for proper file permissions on mounted volumes
+# Note: On macOS, GID 20 (staff) may already exist in container as "dialout"
 ARG USERNAME=claude-user
 ARG HOST_UID=1000
 ARG HOST_GID=1000
-RUN groupadd -g ${HOST_GID} ${USERNAME} && \
+RUN (getent group ${HOST_GID} || groupadd -g ${HOST_GID} ${USERNAME}) && \
     useradd -m -s /bin/zsh -u ${HOST_UID} -g ${HOST_GID} ${USERNAME} && \
     echo "${USERNAME} ALL=(root) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} && \
     chmod 0440 /etc/sudoers.d/${USERNAME}
