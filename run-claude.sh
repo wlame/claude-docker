@@ -85,6 +85,7 @@ EXPORT_DOCKERFILE=""
 PUSH_TO_REPO=""
 ENABLE_GPG=true
 DRY_RUN=false
+INSTALL_PLUGINS=true
 EXTRA_PACKAGES=()
 PASSTHROUGH_ARGS=()
 EXTRA_VOLUMES=()
@@ -235,7 +236,7 @@ _run_claude_completion() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    opts="-w --workspace -c --claude-config -n --name -i --image --rm --no-interactive --privileged --no-privileged --safe --no-gpg --gpg --build --rebuild --recreate --verbose --remove-containers --force-remove-all-containers --export-dockerfile --push-to --generate-completions --username --extra-package -E --forward-variable --aws --mount-rules-only --mount-full-claude -h --help"
+    opts="-w --workspace -c --claude-config -n --name -i --image --rm --no-interactive --privileged --no-privileged --safe --no-gpg --gpg --build --rebuild --recreate --verbose --no-plugins --remove-containers --force-remove-all-containers --export-dockerfile --push-to --generate-completions --username --extra-package -E --forward-variable --aws --mount-rules-only --mount-full-claude -h --help"
 
     case "${prev}" in
         -w|--workspace)
@@ -322,6 +323,7 @@ _run_claude_zsh_completion() {
         '-E[Forward environment variable]:variable:(AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY GITHUB_TOKEN)'
         '--forward-variable[Forward environment variable]:variable:(AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY GITHUB_TOKEN)'
         '--aws[Enable AWS integration: forward AWS vars and mount ~/.aws]'
+        '--no-plugins[Skip baking Claude plugins into image during build]'
         '--mount-rules-only[Only mount settings.json and rules (default on macOS)]'
         '--mount-full-claude[Mount full ~/.claude directory (default on Linux)]'
         '(-h --help)'{-h,--help}'[Show help]'
@@ -375,6 +377,7 @@ usage() {
   echo "                          Use -E !VAR to exclude a variable from the default forwarded list"
   echo "  --aws                   Enable AWS integration: forward common AWS environment variables"
   echo "                          and mount ~/.aws directory to container (readonly)"
+  echo "  --no-plugins            Skip baking Claude plugins into the image during build"
   echo "  --mount-rules-only      Only mount ~/.claude/settings.json and ~/.claude/rules (read-only)"
   echo "                          instead of the full ~/.claude directory. This is the default on macOS"
   echo "                          to avoid path incompatibilities. Use this flag on Linux if needed."
@@ -574,6 +577,10 @@ while [[ $# -gt 0 ]]; do
     fi
     shift
     ;;
+  --no-plugins)
+    INSTALL_PLUGINS=false
+    shift
+    ;;
   --mount-rules-only)
     FORCE_SELECTIVE_MOUNT=true
     shift
@@ -686,6 +693,15 @@ fi
 if [[ ! -d "$CLAUDE_CONFIG_PATH" ]]; then
   echo -e "${YELLOW}Warning: Claude config path does not exist: $CLAUDE_CONFIG_PATH${NC}"
   echo -e "${YELLOW}You may need to run 'claude auth' first${NC}"
+fi
+
+# Detect enabled plugins from host settings
+DETECTED_PLUGINS=""
+if [[ "$INSTALL_PLUGINS" == "true" && -f "$CLAUDE_CONFIG_PATH/settings.json" ]]; then
+  DETECTED_PLUGINS=$(jq -r '.enabledPlugins // {} | to_entries[] | select(.value == true) | .key' "$CLAUDE_CONFIG_PATH/settings.json" 2>/dev/null | tr '\n' ' ')
+  if [[ -n "$DETECTED_PLUGINS" && "$VERBOSE" == "true" ]]; then
+    echo -e "${MAGENTA}Detected plugins from host: ${BRIGHT_CYAN}$DETECTED_PLUGINS${NC}"
+  fi
 fi
 
 # Build docker run command
@@ -1290,6 +1306,10 @@ ENV PATH="/home/$USERNAME/.local/share/fnm:$PATH"
 SHELL ["/bin/bash", "-c"]
 RUN eval "$(fnm env)" && fnm install 22 && fnm default 22 && fnm use 22
 
+# Install uv (Python package manager by Astral, provides uvx)
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/home/$USERNAME/.local/bin:$PATH"
+
 # Install LazyVim
 RUN git clone https://github.com/LazyVim/starter ~/.config/nvim && \
     rm -rf ~/.config/nvim/.git
@@ -1321,6 +1341,92 @@ RUN eval "$(fnm env)" && claude mcp add context7 \
 RUN eval "$(fnm env)" && claude mcp add playwright \
     --scope user \
     npx @playwright/mcp@latest
+DOCKERFILE_EOF
+
+  # Conditionally add plugin setup to Dockerfile
+  if [[ "$INSTALL_PLUGINS" == "true" && -n "$DETECTED_PLUGINS" ]]; then
+    # Create the setup-plugins script
+    local setup_plugins_script='#!/bin/sh
+set -e
+
+PLUGIN_LIST="$1"
+if [ -z "$PLUGIN_LIST" ]; then
+  echo "No plugins to install"
+  exit 0
+fi
+
+CLAUDE_DIR="$HOME/.claude"
+MKT_NAME="claude-plugins-official"
+MKT_REPO="https://github.com/anthropics/claude-plugins-official.git"
+MKT_DIR="$CLAUDE_DIR/plugins/marketplaces/$MKT_NAME"
+CACHE_DIR="$CLAUDE_DIR/plugins/cache/$MKT_NAME"
+
+mkdir -p "$(dirname "$MKT_DIR")"
+git clone --depth 1 "$MKT_REPO" "$MKT_DIR"
+
+GIT_SHA=$(cd "$MKT_DIR" && git rev-parse HEAD)
+GIT_SHORT=$(echo "$GIT_SHA" | cut -c1-12)
+TS=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+
+mkdir -p "$CACHE_DIR"
+
+INST="$CLAUDE_DIR/plugins/installed_plugins.json"
+SETT="$CLAUDE_DIR/settings.json"
+
+printf "{\n  \"version\": 2,\n  \"plugins\": {" > "$INST"
+printf "{\n  \"enabledPlugins\": {" > "$SETT"
+
+FIRST=true
+for ENTRY in $PLUGIN_LIST; do
+  NAME="${ENTRY%%@*}"
+
+  SRC=""
+  [ -d "$MKT_DIR/plugins/$NAME" ] && SRC="$MKT_DIR/plugins/$NAME"
+  [ -d "$MKT_DIR/external_plugins/$NAME" ] && SRC="$MKT_DIR/external_plugins/$NAME"
+
+  if [ -z "$SRC" ]; then
+    echo "Warning: Plugin $NAME not found in marketplace, skipping"
+    continue
+  fi
+
+  DEST="$CACHE_DIR/$NAME/$GIT_SHORT"
+  mkdir -p "$DEST"
+  cp -r "$SRC/." "$DEST/"
+
+  if [ "$FIRST" = true ]; then
+    FIRST=false
+  else
+    printf "," >> "$INST"
+    printf "," >> "$SETT"
+  fi
+
+  printf "\n    \"%s\": [{\"scope\":\"user\",\"installPath\":\"%s\",\"version\":\"%s\",\"installedAt\":\"%s\",\"lastUpdated\":\"%s\",\"gitCommitSha\":\"%s\"}]" \
+    "$ENTRY" "$DEST" "$GIT_SHORT" "$TS" "$TS" "$GIT_SHA" >> "$INST"
+  printf "\n    \"%s\": true" "$ENTRY" >> "$SETT"
+
+  echo "Installed plugin: $ENTRY"
+done
+
+printf "\n  }\n}\n" >> "$INST"
+printf "\n  }\n}\n" >> "$SETT"
+
+printf "{\n  \"%s\": {\n    \"source\": {\"source\":\"github\",\"repo\":\"anthropics/%s\"},\n    \"installLocation\": \"%s\",\n    \"lastUpdated\": \"%s\"\n  }\n}\n" \
+  "$MKT_NAME" "$MKT_NAME" "$MKT_DIR" "$TS" > "$CLAUDE_DIR/plugins/known_marketplaces.json"
+
+echo "Plugin setup complete"
+'
+
+    local setup_plugins_b64=$(echo -n "$setup_plugins_script" | base64 | tr -d '\n')
+
+    echo ""
+    echo "# Setup Claude plugins from host configuration"
+    echo "RUN echo '$setup_plugins_b64' | base64 -d > /tmp/setup-plugins.sh && chmod +x /tmp/setup-plugins.sh && \\"
+    echo "    /tmp/setup-plugins.sh '$DETECTED_PLUGINS' && \\"
+    echo "    rm /tmp/setup-plugins.sh"
+    echo ""
+  fi
+
+  cat <<'DOCKERFILE_EOF'
 
 # ============================================================================
 # Stage 4: Final runtime image
