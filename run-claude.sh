@@ -1476,6 +1476,9 @@ DOCKERFILE_EOF
 USER $USERNAME
 WORKDIR /home/$USERNAME
 
+# Set COLORTERM for true color support
+ENV COLORTERM=truecolor
+
 # Configure zsh with theme, plugins, and aliases
 DOCKERFILE_EOF
 
