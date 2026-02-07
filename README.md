@@ -5,7 +5,9 @@ Run claude code in somewhat safe and isolated yolo mode
 ## Features
 
 - 🚀 **Standalone Script**: Single file contains everything - Dockerfile, MCP servers, configuration
-- 🤖 **Pre-configured MCP Servers**: Unsplash, Context7, and Playwright ready to use
+- 🤖 **Pre-configured MCP Servers**: Unsplash, Context7, Playwright, and Serena ready to use
+- 🧩 **Plugins baked in**: Detects host plugins and bakes them into the image at build time
+- ⚡ **SuperClaude**: 30+ `sc:*` slash commands for structured development workflows
 - 🔧 **Auto-build**: Automatically builds Docker image if it doesn't exist
 - 🔒 **Secure**: Host system protected by Docker boundaries with read-only mounts
 - ⚡ **Fast Setup**: No manual Docker builds or MCP configuration needed
@@ -25,6 +27,10 @@ Run claude code in somewhat safe and isolated yolo mode
   - [MCP Servers](#mcp-servers)
   - [Environment Variables](#environment-variables)
   - [Volume Mounts](#volume-mounts)
+- [Serena (Semantic Code Analysis)](#serena-semantic-code-analysis)
+  - [Running a Persistent Host Server](#running-a-persistent-host-server)
+  - [How the Fallback Works](#how-the-fallback-works)
+- [SuperClaude Commands](#superclaude-commands)
 - [Testing the Setup](#testing-the-setup)
 - [Advanced Usage](#advanced-usage)
   - [Custom Image Names](#custom-image-names)
@@ -147,6 +153,7 @@ Automatically configured and ready to use:
 - **Unsplash**: Photo search and download (`unsplash-mcp-server`)
 - **Context7**: AI context service (`https://mcp.context7.com/mcp`)
 - **Playwright**: Browser automation (`@playwright/mcp@latest`)
+- **Serena**: Semantic code analysis with LSP integration (see [Serena section](#serena-semantic-code-analysis))
 
 ### Environment Variables
 
@@ -193,6 +200,68 @@ The script makes a best effort to forward your Claude authentication into the co
 - **Permission Bypass**: Automatically enables bypass permissions mode for streamlined operation
 
 **Important:** On your first run, you may need to run `claude /login` inside the container. After that initial authentication, your login state is preserved and forwarded automatically for future runs.
+
+## Serena (Semantic Code Analysis)
+
+[Serena](https://github.com/oraios/serena) is an MCP server that provides intelligent code understanding, refactoring, and navigation through language server protocol (LSP) integration. It is always installed in the container image.
+
+### Running a Persistent Host Server
+
+By default, Serena runs as a child process (stdio) inside each Claude session. For better performance, you can run a persistent Serena server on the host and have containers connect to it over HTTP.
+
+**Benefits of a host-side server:**
+- **Warm LSP cache** -- language server stays running, so symbol lookups are instant
+- **Single process** -- no startup cost per Claude session
+- **Web dashboard** -- monitor Serena's activity at `http://localhost:8765`
+- **Shared knowledge** -- Serena's memories persist across all container sessions (they're stored in `.serena/memories/` inside your project, which is already mounted)
+
+**Start the server on your host:**
+
+```bash
+# Install uv if you don't have it
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Start Serena with HTTP transport (run from your project directory)
+uvx --from git+https://github.com/oraios/serena serena start-mcp-server \
+    --transport streamable-http \
+    --port 8765 \
+    --project-from-cwd \
+    --enable-web-dashboard true
+```
+
+Then launch your container as usual. The entrypoint automatically detects the host server and connects.
+
+You can customize the port with the `SERENA_PORT` environment variable:
+
+```bash
+SERENA_PORT=9000 ./run-claude.sh
+```
+
+### How the Fallback Works
+
+On every container startup, the entrypoint script checks if `localhost:8765` (or `$SERENA_PORT`) is reachable:
+
+- **Host server running** -- Serena is reconfigured to use HTTP transport (`http://localhost:8765/mcp`). This works because containers run with `--network host`.
+- **No host server** -- Serena uses its built-in stdio transport, spawning a local instance via `uvx`. Project data in `.serena/` (config, memories) still persists through the workspace mount.
+
+Either way, Serena works out of the box with no manual configuration.
+
+## SuperClaude Commands
+
+The image includes [SuperClaude](https://github.com/SuperClaude-Org/SuperClaude_Framework), which adds 30+ structured slash commands for development workflows. These are installed during image build via `uvx superclaude install` and available as `/sc:*` commands.
+
+**Available commands include:**
+
+| Category | Commands |
+|----------|----------|
+| Development | `/sc:implement`, `/sc:build`, `/sc:design` |
+| Analysis | `/sc:analyze`, `/sc:troubleshoot`, `/sc:explain` |
+| Quality | `/sc:improve`, `/sc:test`, `/sc:cleanup` |
+| Planning | `/sc:estimate`, `/sc:brainstorm`, `/sc:spec-panel` |
+| Project | `/sc:git`, `/sc:document`, `/sc:task`, `/sc:workflow` |
+| Research | `/sc:research`, `/sc:index`, `/sc:index-repo` |
+
+Run `/sc:help` inside a Claude session for the full list.
 
 ## Testing the Setup
 
@@ -290,13 +359,15 @@ source ~/.bashrc
 - ✅ **Host isolation**: Host system protected by Docker boundaries
 - ✅ **Read-only mounts**: SSH keys and system configs mounted read-only
 - ✅ **User isolation**: Runs as non-root user inside container
-- ⚠️ **Privileged mode**: Required for dangerous permissions functionality
+- ✅ **Targeted capabilities**: Uses `SYS_ADMIN` + `seccomp=unconfined` instead of full privileged mode
+- ⚠️ **Privileged mode**: Available via `--privileged` flag if explicitly needed
 
 ### Dangerous Permissions
 
-- Container has `--privileged` flag for full system access within container
+- Container uses targeted capabilities for Playwright/Chromium (not full `--privileged`)
 - Claude runs with `--dangerously-skip-permissions` by default
-- Only use with trusted code and repositories
+- Use `--safe` flag to disable dangerous permissions
+- Use `--privileged` flag only if you need full Docker privileged mode
 - All file modifications are contained within mounted volumes
 
 ### Best Practices

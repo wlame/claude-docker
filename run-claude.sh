@@ -1162,6 +1162,25 @@ if [ -S "/gpg-agent-extra" ]; then
   fi
 fi
 
+# Detect host Serena server and switch MCP transport if available
+SERENA_PORT="${SERENA_PORT:-8765}"
+if curl -sf --max-time 1 "http://localhost:$SERENA_PORT/mcp" -o /dev/null 2>/dev/null; then
+  # Host Serena available — reconfigure as HTTP transport
+  if [ -f "$HOME/.claude.json" ]; then
+    jq --arg url "http://localhost:$SERENA_PORT/mcp" \
+      ".mcpServers.serena = {type: \"http\", url: \$url}" \
+      "$HOME/.claude.json" > "$HOME/.claude.json.tmp" && \
+      mv "$HOME/.claude.json.tmp" "$HOME/.claude.json"
+  fi
+  if [ "$RUN_CLAUDE_VERBOSE" = "1" ]; then
+    echo "Serena: connected to host server at localhost:$SERENA_PORT"
+  fi
+else
+  if [ "$RUN_CLAUDE_VERBOSE" = "1" ]; then
+    echo "Serena: no host server detected, using built-in stdio mode"
+  fi
+fi
+
 # Change to workspace directory if provided
 if [ -n "$WORKSPACE_PATH" ] && [ -d "$WORKSPACE_PATH" ]; then
   cd "$WORKSPACE_PATH"
@@ -1341,6 +1360,14 @@ RUN eval "$(fnm env)" && claude mcp add context7 \
 RUN eval "$(fnm env)" && claude mcp add playwright \
     --scope user \
     npx @playwright/mcp@latest
+
+# Add Serena MCP server (stdio fallback; entrypoint upgrades to HTTP if host server available)
+RUN eval "$(fnm env)" && claude mcp add serena \
+    --scope user \
+    -- uvx --from git+https://github.com/oraios/serena serena start-mcp-server --project-from-cwd
+
+# Install SuperClaude commands (sc:* slash commands)
+RUN uvx superclaude install
 DOCKERFILE_EOF
 
   # Conditionally add plugin setup to Dockerfile
